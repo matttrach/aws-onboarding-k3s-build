@@ -5,36 +5,37 @@
 # - vpc security group, allowing only 22 & 8080 to your home IP 'curl ipinfo.io/ip' https://us-west-1.console.aws.amazon.com/ec2/v2/home?region=us-west-1#SecurityGroups:
 # - ubuntu image from cannonical 
 locals {
-    instance_type = "t2.medium"
-    key_name = "matttrach-initial"
-    name = "mt-k3s-default"
-    user = "matttrach"
-    use = "onboarding"
-    security_group = "sg-06bf73fa3affae222"
-    vpc = "vpc-3d1f335a"
-    subnet = "subnet-0835c74adb9e4a860"
-    ami = "ami-01f87c43e618bf8f0"
+    instance_type   = "t2.medium"
+    key_name        = "matttrach-initial"
+    user            = "matttrach"
+    use             = "onboarding"
+    security_group  = "sg-06bf73fa3affae222"
+    vpc             = "vpc-3d1f335a"
+    subnet          = "subnet-0835c74adb9e4a860"
+    ami             = "ami-01f87c43e618bf8f0"
+    servers         = toset(["k3s0","k3s1","k3s2"])
+    agents          = toset(["k3s1","k3s2"])
 }
 
-data "aws_vpc" "selected" {
-  default = true
+resource "random_uuid" "cluster_token" {
 }
 
 resource "aws_instance" "k3s" {
-  ami                    = local.ami
-  instance_type          = local.instance_type
-  vpc_security_group_ids = [local.security_group]
-  subnet_id              = local.subnet
-  key_name               = local.key_name
-  instance_initiated_shutdown_behavior = "terminate"
+  for_each                    = local.servers
+  ami                         = local.ami
+  instance_type               = local.instance_type
+  vpc_security_group_ids      = [local.security_group]
+  subnet_id                   = local.subnet
+  key_name                    = local.key_name
   associate_public_ip_address = true
+  instance_initiated_shutdown_behavior = "terminate"
   user_data = <<-EOT
   #cloud-config
   disable_root: false
   EOT
 
   tags = {
-    Name = "k3s-default"
+    Name = each.key
     User = local.user
     Use  = local.use
   }
@@ -42,7 +43,7 @@ resource "aws_instance" "k3s" {
   connection {
     type        = "ssh"
     user        = "root"
-    script_path = "/usr/local/bin/initial"
+    script_path = "/usr/bin/initial"
     agent       = true
     host        = self.public_ip
   }
@@ -63,43 +64,67 @@ resource "aws_instance" "k3s" {
   }
 }
 
-resource "null_resource" "update" {
+resource "null_resource" "server" {
   depends_on = [
     aws_instance.k3s,
   ]
   connection {
     type        = "ssh"
     user        = "root"
-    script_path = "/usr/local/bin/update"
+    script_path = "/usr/bin/server"
     agent       = true
-    host        = aws_instance.k3s.public_ip
+    host        = aws_instance.k3s["k3s0"].public_ip
   }
 
   provisioner "remote-exec" {
     inline = [<<-EOT
-      apt update
+      curl -sfL https://get.k3s.io | K3S_TOKEN=${random_uuid.cluster_token.result} sh -
+      sleep 15
+      k3s kubectl get node
     EOT
     ]
   }
 }
 
-resource "null_resource" "install" {
+resource "null_resource" "agents" {
   depends_on = [
     aws_instance.k3s,
-    null_resource.update,
+    null_resource.server,
   ]
+  for_each = local.agents
   connection {
     type        = "ssh"
     user        = "root"
-    script_path = "/usr/local/bin/install"
+    script_path = "/usr/bin/agents"
     agent       = true
-    host        = aws_instance.k3s.public_ip
+    host        = aws_instance.k3s[each.key].public_ip
   }
 
   provisioner "remote-exec" {
     inline = [<<-EOT
-      curl -sfL https://get.k3s.io | sh -
+      curl -sfL https://get.k3s.io | K3S_TOKEN=${random_uuid.cluster_token.result} K3S_URL="https://${aws_instance.k3s["k3s0"].public_dns}:6443" sh -
       sleep 15
+    EOT
+    ]
+  }
+}
+
+resource "null_resource" "validate" {
+  depends_on = [
+    aws_instance.k3s,
+    null_resource.server,
+    null_resource.agents,
+  ]
+  connection {
+    type        = "ssh"
+    user        = "root"
+    script_path = "/usr/bin/validate"
+    agent       = true
+    host        = aws_instance.k3s["k3s0"].public_ip
+  }
+
+  provisioner "remote-exec" {
+    inline = [<<-EOT
       k3s kubectl get node
     EOT
     ]
